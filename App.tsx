@@ -56,12 +56,23 @@ const App: React.FC = () => {
 
   const handleFilesAdded = useCallback(async (acceptedFiles: File[]) => {
     const newFiles: FileInfo[] = [];
+    
+    // Check if PDF.js is loaded
+    if (typeof (window as any).pdfjsLib === 'undefined') {
+      alert('PDF viewer is still loading. Please wait a moment and try again.');
+      return;
+    }
+    
     for (const file of acceptedFiles) {
       if (file.type !== 'application/pdf') continue;
 
       try {
         const fileBuffer = await file.arrayBuffer();
-        const pdfjsDoc = await (window as any).pdfjsLib.getDocument({ data: fileBuffer }).promise;
+        const loadingTask = (window as any).pdfjsLib.getDocument({ 
+          data: fileBuffer,
+          verbosity: 0
+        });
+        const pdfjsDoc = await loadingTask.promise;
         const totalPages = pdfjsDoc.numPages;
 
         const pages: PageInfo[] = Array.from({ length: totalPages }, (_, i) => ({

@@ -19,23 +19,27 @@ const PdfPreviewer: React.FC<PdfPreviewerProps> = ({ fileInfo, activePageIndex, 
   const [previewDimensions, setPreviewDimensions] = useState({ width: 0, height: 0 });
 
   useEffect(() => {
-    setPdfDoc(null); // Reset doc on file change to trigger reload
+    setPdfDoc(null);
+    setIsLoading(true);
     const loadPdf = async () => {
-      setIsLoading(true);
       try {
+        // Check if pdfjsLib is available
+        if (typeof (window as any).pdfjsLib === 'undefined') {
+          console.error('PDF.js library not loaded');
+          setIsLoading(false);
+          return;
+        }
+
         const fileBuffer = await fileInfo.file.arrayBuffer();
         
-        // More robust PDF loading for preview
+        // Simple PDF loading configuration
         const loadingTask = (window as any).pdfjsLib.getDocument({
           data: fileBuffer,
-          cMapUrl: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/cmaps/',
-          cMapPacked: true,
-          standardFontDataUrl: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/standard_fonts/',
-          disableAutoFetch: false,
-          disableStream: false
+          verbosity: 0
         });
         
         const doc = await loadingTask.promise;
+        console.log('PDF loaded successfully, pages:', doc.numPages);
         setPdfDoc(doc);
       } catch (error) {
         console.error("Failed to load PDF for preview:", error);
@@ -46,7 +50,7 @@ const PdfPreviewer: React.FC<PdfPreviewerProps> = ({ fileInfo, activePageIndex, 
   }, [fileInfo.id, fileInfo.file]);
 
   useEffect(() => {
-    if (!pdfDoc) return;
+    if (!pdfDoc || isLoading) return;
     setIsLoading(true);
 
     const renderPage = async () => {
@@ -54,18 +58,14 @@ const PdfPreviewer: React.FC<PdfPreviewerProps> = ({ fileInfo, activePageIndex, 
         const page = await pdfDoc.getPage(activePageIndex + 1);
         
         if (!page) {
-          console.error("Failed to get page", activePageIndex + 1);
-          setIsLoading(false);
-          return;
+          throw new Error(`Failed to get page ${activePageIndex + 1}`);
         }
-        
+
         const desiredWidth = 600;
         const viewport = page.getViewport({ scale: 1.0 });
         
         if (!viewport || viewport.width <= 0 || viewport.height <= 0) {
-          console.error("Invalid viewport for page", activePageIndex + 1);
-          setIsLoading(false);
-          return;
+          throw new Error(`Invalid viewport for page ${activePageIndex + 1}`);
         }
         
         const scale = desiredWidth / viewport.width;
@@ -73,14 +73,12 @@ const PdfPreviewer: React.FC<PdfPreviewerProps> = ({ fileInfo, activePageIndex, 
   
         const canvas = canvasRef.current;
         if (!canvas) {
-          setIsLoading(false);
-          return;
+          throw new Error('Canvas not available');
         }
   
         const context = canvas.getContext('2d');
         if (!context) {
-          setIsLoading(false);
-          return;
+          throw new Error('Canvas context not available');
         }
         
         // Clear canvas before rendering
@@ -97,6 +95,7 @@ const PdfPreviewer: React.FC<PdfPreviewerProps> = ({ fileInfo, activePageIndex, 
           width: scaledViewport.width, 
           height: scaledViewport.height
         });
+        console.log('Canvas dimensions set:', scaledViewport.width, 'x', scaledViewport.height);
   
         const renderContext = {
           canvasContext: context,
@@ -106,6 +105,7 @@ const PdfPreviewer: React.FC<PdfPreviewerProps> = ({ fileInfo, activePageIndex, 
         
         const renderTask = page.render(renderContext);
         await renderTask.promise;
+        console.log('Page rendered successfully');
         
       } catch(error) {
         console.error("Failed to render page", activePageIndex + 1, error);
