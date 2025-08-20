@@ -19,6 +19,7 @@ export interface FileInfo {
   size: number;
   totalPages: number;
   pages: PageInfo[];
+  password?: string;
 }
 
 export interface WatermarkSettings {

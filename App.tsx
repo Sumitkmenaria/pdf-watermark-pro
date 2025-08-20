@@ -1,6 +1,6 @@
 
 import React, { useState, useCallback, useMemo, useEffect } from 'react';
-import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
+import { PDFDocument, rgb, StandardFonts, EncryptedPDFError } from 'pdf-lib';
 import { FileInfo, WatermarkSettings, PageInfo, WatermarkPosition } from './types';
 import FileUploader from './components/FileUploader';
 import PdfPreviewer from './components/PdfPreviewer';
@@ -56,23 +56,11 @@ const App: React.FC = () => {
 
   const handleFilesAdded = useCallback(async (acceptedFiles: File[]) => {
     const newFiles: FileInfo[] = [];
-    
-    // Check if PDF.js is loaded
-    if (typeof (window as any).pdfjsLib === 'undefined') {
-      alert('PDF viewer is still loading. Please wait a moment and try again.');
-      return;
-    }
-    
-    for (const file of acceptedFiles) {
-      if (file.type !== 'application/pdf') continue;
 
+    const processFile = async (file: File, password?: string): Promise<FileInfo | null> => {
       try {
         const fileBuffer = await file.arrayBuffer();
-        const loadingTask = (window as any).pdfjsLib.getDocument({ 
-          data: fileBuffer,
-          verbosity: 0
-        });
-        const pdfjsDoc = await loadingTask.promise;
+        const pdfjsDoc = await (window as any).pdfjsLib.getDocument({ data: fileBuffer, password }).promise;
         const totalPages = pdfjsDoc.numPages;
 
         const pages: PageInfo[] = Array.from({ length: totalPages }, (_, i) => ({
@@ -87,12 +75,37 @@ const App: React.FC = () => {
           size: file.size,
           totalPages,
           pages,
+          password,
         };
-        newFiles.push(newFileInfo);
+        return newFileInfo;
 
-      } catch (error) {
-        console.error("Failed to process file:", file.name, error);
-        alert(`Could not process ${file.name}. It might be corrupted or not a valid PDF.`);
+      } catch (error: any) {
+        if (error.name === 'PasswordException') {
+            if (password !== undefined) { // Password provided was incorrect
+                alert(`Incorrect password for "${file.name}". The file could not be opened.`);
+                return null;
+            }
+            // Ask for password
+            const userPassword = prompt(`The file "${file.name}" is password-protected. Please enter the password:`);
+            if (userPassword !== null) { // User entered password and clicked OK
+                return processFile(file, userPassword);
+            }
+            // User clicked cancel
+            return null;
+        } else {
+            console.error("Failed to process file:", file.name, error);
+            alert(`Could not process ${file.name}. It might be corrupted or not a valid PDF.`);
+            return null;
+        }
+      }
+    };
+    
+    for (const file of acceptedFiles) {
+      if (file.type !== 'application/pdf') continue;
+
+      const newFileInfo = await processFile(file);
+      if (newFileInfo) {
+        newFiles.push(newFileInfo);
       }
     }
 
@@ -179,21 +192,10 @@ const App: React.FC = () => {
 
     try {
       const fileBuffer = await activeFile.file.arrayBuffer();
-      
-      // More robust PDF loading with better error handling
-      let pdfDoc;
-      try {
-        pdfDoc = await PDFDocument.load(fileBuffer, { 
-          ignoreEncryption: true,
-          capNumbers: false,
-          throwOnInvalidObject: false
-        });
-      } catch (loadError) {
-        console.error("Initial PDF load failed, trying alternative approach:", loadError);
-        // Try loading without options as fallback
-        pdfDoc = await PDFDocument.load(fileBuffer);
-      }
-      
+      // pdf-lib does not support loading password-protected PDFs.
+      // The call will throw an EncryptedPDFError if the file is encrypted,
+      // which is handled in the catch block.
+      const pdfDoc = await PDFDocument.load(fileBuffer);
       const helveticaFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
       const helveticaBoldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
 
@@ -205,152 +207,65 @@ PURPOSE: ${watermarkSettings.purpose || 'N/A'}`;
       const textLines = watermarkText.split('\n');
 
       for (let i = 0; i < activeFile.totalPages; i++) {
-        const pages = pdfDoc.getPages();
-        if (i >= pages.length) {
-          console.warn(`Page ${i + 1} not found in PDF, skipping`);
-          continue;
-        }
-        
-        const page = pages[i];
+        const page = pdfDoc.getPages()[i];
         const { width: pageWidth, height: pageHeight } = page.getSize();
-        
-        // Validate page dimensions
-        if (!pageWidth || !pageHeight || pageWidth <= 0 || pageHeight <= 0) {
-          console.warn(`Invalid page dimensions for page ${i + 1}, skipping`);
-          continue;
-        }
         
         const previewWidth = 600; 
         const scaleFactor = pageWidth / previewWidth;
         
         const pos = activeFile.pages[i].watermarkPosition;
-        
-        // Validate watermark position
-        if (!pos || typeof pos.x !== 'number' || typeof pos.y !== 'number') {
-          console.warn(`Invalid watermark position for page ${i + 1}, using defaults`);
-          continue;
-        }
 
-        // Account for preview offset and coordinate system differences
+        // In the preview, the Rnd component has a 2px border. The inner div has p-1 (4px) padding.
+        // Total offset from the Rnd position handles this visual difference.
         const previewOffset = 6; // px
-        const pdfOffset = previewOffset * scaleFactor;
+        const pdfOffset = previewOffset * scaleFactor; // in points
         
-        // Calculate actual PDF coordinates
-        const x = Math.max(0, (pos.x * scaleFactor) + pdfOffset);
-        const y_top_of_box = pageHeight - (pos.y * scaleFactor) - pdfOffset;
+        const x = (pos.x * scaleFactor) + pdfOffset;
+        const y_top_of_box = pageHeight - (pos.y * scaleFactor);
         
         const fontSize = watermarkSettings.fontSize;
-        
-        // Validate font size
-        if (!fontSize || fontSize <= 0) {
-          console.warn(`Invalid font size: ${fontSize}, using default`);
-          continue;
-        }
-        
         const line_height = fontSize * 1.5;
 
-        // Use standard ascent ratio for Helvetica to ensure consistent positioning
+        // Ascent is the distance a font extends above the baseline.
+        // The previous dynamic calculation `((font.ascent / font.unitsPerEm) * size)` was failing
+        // because font properties were not reliably available, leading to a `NaN` value for `ascent`
+        // and causing the entire watermark application to fail.
+        // Using a fixed, standard ascent ratio for Helvetica (0.718) is a robust workaround
+        // that prevents this error and ensures consistent positioning.
         const ascent = 0.718 * fontSize;
         
-        // Calculate starting Y position for text baseline
-        let currentY = Math.max(ascent, y_top_of_box - ascent);
-        
-        // Ensure text doesn't go below page bounds
-        const minY = ascent;
-        const maxY = pageHeight - (textLines.length * line_height);
-        currentY = Math.min(Math.max(currentY, minY), Math.max(maxY, minY));
+        // Start from top of box, adjust for padding/border, then for font ascent to find the first baseline.
+        let currentY = y_top_of_box - pdfOffset - ascent;
 
-        // Draw each line of the watermark
-        textLines.forEach((line, lineIndex) => {
-          try {
-            const font = (line.startsWith("COPY SHARED") || line.startsWith("LIMITED USE")) ? helveticaBoldFont : helveticaFont;
-            
-            // Ensure we don't draw outside page bounds
-            const textY = currentY - (lineIndex * line_height);
-            if (textY < minY || textY > pageHeight) {
-              return; // Skip this line if it would be outside bounds
-            }
-            
-            // Ensure X coordinate is within bounds
-            const textX = Math.min(x, pageWidth - 10); // Leave 10pt margin from right edge
-            
-            page.drawText(line, {
-                x: textX,
-                y: textY,
+        textLines.forEach((line) => {
+             const font = (line.startsWith("COPY SHARED") || line.startsWith("LIMITED USE")) ? helveticaBoldFont : helveticaFont;
+             page.drawText(line, {
+                x: x,
+                y: currentY,
                 font: font,
                 size: fontSize,
                 color: rgb(0, 0.18, 0.39),
-                opacity: Math.max(0.1, Math.min(1.0, watermarkSettings.opacity / 100)),
+                opacity: watermarkSettings.opacity / 100,
             });
-          } catch (textError) {
-            console.error(`Error drawing text line "${line}" on page ${i + 1}:`, textError);
-          }
+            currentY -= line_height;
         });
       }
 
-      // Generate PDF with better error handling
-      let pdfBytes;
-      try {
-        pdfBytes = await pdfDoc.save({
-          useObjectStreams: false,
-          addDefaultPage: false,
-          objectsPerTick: 50
-        });
-      } catch (saveError) {
-        console.error("PDF save failed with options, trying basic save:", saveError);
-        // Fallback to basic save
-        pdfBytes = await pdfDoc.save();
-      }
-      
-      // Validate generated PDF
-      if (!pdfBytes || pdfBytes.length === 0) {
-        throw new Error("Generated PDF is empty or invalid");
-      }
-
-      // Create and download the file
+      const pdfBytes = await pdfDoc.save();
       const blob = new Blob([pdfBytes], { type: 'application/pdf' });
-      
-      // Validate blob
-      if (blob.size === 0) {
-        throw new Error("Generated PDF blob is empty");
-      }
-      
-      const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
-      link.href = url;
-      
-      // Generate safe filename
-      const originalName = activeFile.name.replace('.pdf', '');
-      const safeFileName = originalName.replace(/[^a-zA-Z0-9\-_]/g, '_');
-      link.download = `${safeFileName}-watermarked.pdf`;
-      
-      // Trigger download
-      document.body.appendChild(link);
+      link.href = URL.createObjectURL(blob);
+      link.download = `${activeFile.name.replace('.pdf', '')}-watermarked.pdf`;
       link.click();
-      document.body.removeChild(link);
-      
-      // Clean up URL
-      setTimeout(() => {
-        URL.revokeObjectURL(url);
-      }, 1000);
+      URL.revokeObjectURL(link.href);
 
     } catch (error) {
       console.error("Failed to apply watermark:", error);
-      let errorMessage = "An error occurred while applying the watermark.";
-      
-      if (error instanceof Error) {
-        if (error.message.includes('encrypted')) {
-          errorMessage = "This PDF is encrypted and cannot be processed. Please use an unencrypted version.";
-        } else if (error.message.includes('corrupted') || error.message.includes('invalid')) {
-          errorMessage = "This PDF appears to be corrupted or invalid. Please try with a different file.";
-        } else if (error.message.includes('permissions')) {
-          errorMessage = "Insufficient permissions to modify this PDF.";
-        } else {
-          errorMessage = `PDF processing failed: ${error.message}`;
-        }
+      if (error instanceof EncryptedPDFError) {
+        alert("Applying watermarks to password-protected PDF files is not supported. Please use a decrypted version of the file.");
+      } else {
+        alert("An error occurred while applying the watermark. The PDF might be corrupted.");
       }
-      
-      alert(errorMessage);
     } finally {
       setIsProcessing(false);
     }
