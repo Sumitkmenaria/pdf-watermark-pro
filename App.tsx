@@ -168,7 +168,21 @@ const App: React.FC = () => {
 
     try {
       const fileBuffer = await activeFile.file.arrayBuffer();
-      const pdfDoc = await PDFDocument.load(fileBuffer, { ignoreEncryption: true });
+      
+      // More robust PDF loading with better error handling
+      let pdfDoc;
+      try {
+        pdfDoc = await PDFDocument.load(fileBuffer, { 
+          ignoreEncryption: true,
+          capNumbers: false,
+          throwOnInvalidObject: false
+        });
+      } catch (loadError) {
+        console.error("Initial PDF load failed, trying alternative approach:", loadError);
+        // Try loading without options as fallback
+        pdfDoc = await PDFDocument.load(fileBuffer);
+      }
+      
       const helveticaFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
       const helveticaBoldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
 
@@ -180,39 +194,247 @@ PURPOSE: ${watermarkSettings.purpose || 'N/A'}`;
       const textLines = watermarkText.split('\n');
 
       for (let i = 0; i < activeFile.totalPages; i++) {
-        const page = pdfDoc.getPages()[i];
+        const pages = pdfDoc.getPages();
+        if (i >= pages.length) {
+          console.warn(`Page ${i + 1} not found in PDF, skipping`);
+          continue;
+        }
+        
+        const page = pages[i];
         const { width: pageWidth, height: pageHeight } = page.getSize();
+        
+        // Validate page dimensions
+        if (!pageWidth || !pageHeight || pageWidth <= 0 || pageHeight <= 0) {
+          console.warn(`Invalid page dimensions for page ${i + 1}, skipping`);
+          continue;
+        }
         
         const previewWidth = 600; 
         const scaleFactor = pageWidth / previewWidth;
         
         const pos = activeFile.pages[i].watermarkPosition;
-
-        // In the preview, the Rnd component has a 2px border. The inner div has p-1 (4px) padding.
-        // Total offset from the Rnd position handles this visual difference.
-        const previewOffset = 6; // px
-        const pdfOffset = previewOffset * scaleFactor; // in points
         
-        const x = (pos.x * scaleFactor) + pdfOffset;
-        const y_top_of_box = pageHeight - (pos.y * scaleFactor);
+        // Validate watermark position
+        if (!pos || typeof pos.x !== 'number' || typeof pos.y !== 'number') {
+          console.warn(`Invalid watermark position for page ${i + 1}, using defaults`);
+          continue;
+        }
+
+        // Account for preview offset and coordinate system differences
+        const previewOffset = 6; // px
+        const pdfOffset = previewOffset * scaleFactor;
+        
+        // Calculate actual PDF coordinates
+        const x = Math.max(0, (pos.x * scaleFactor) + pdfOffset);
+        const y_top_of_box = pageHeight - (pos.y * scaleFactor) - pdfOffset;
         
         const fontSize = watermarkSettings.fontSize;
+        
+        // Validate font size
+        if (!fontSize || fontSize <= 0) {
+          console.warn(`Invalid font size: ${fontSize}, using default`);
+          continue;
+        }
+        
         const line_height = fontSize * 1.5;
 
-        // Ascent is the distance a font extends above the baseline.
-        // The previous dynamic calculation `((font.ascent / font.unitsPerEm) * size)` was failing
-        // because font properties were not reliably available, leading to a `NaN` value for `ascent`
-        // and causing the entire watermark application to fail.
-        // Using a fixed, standard ascent ratio for Helvetica (0.718) is a robust workaround
-        // that prevents this error and ensures consistent positioning.
+        // Use standard ascent ratio for Helvetica to ensure consistent positioning
         const ascent = 0.718 * fontSize;
         
-        // Start from top of box, adjust for padding/border, then for font ascent to find the first baseline.
-        let currentY = y_top_of_box - pdfOffset - ascent;
+        // Calculate starting Y position for text baseline
+        let currentY = Math.max(ascent, y_top_of_box - ascent);
+        
+        // Ensure text doesn't go below page bounds
+        const minY = ascent;
+        const maxY = pageHeight - (textLines.length * line_height);
+        currentY = Math.min(Math.max(currentY, minY), Math.max(maxY, minY));
 
-        textLines.forEach((line) => {
-             const font = (line.startsWith("COPY SHARED") || line.startsWith("LIMITED USE")) ? helveticaBoldFont : helveticaFont;
-             page.drawText(line, {
+        // Draw each line of the watermark
+        textLines.forEach((line, lineIndex) => {
+          try {
+            const font = (line.startsWith("COPY SHARED") || line.startsWith("LIMITED USE")) ? helveticaBoldFont : helveticaFont;
+            
+            // Ensure we don't draw outside page bounds
+            const textY = currentY - (lineIndex * line_height);
+            if (textY < minY || textY > pageHeight) {
+              return; // Skip this line if it would be outside bounds
+            }
+            
+            // Ensure X coordinate is within bounds
+            const textX = Math.min(x, pageWidth - 10); // Leave 10pt margin from right edge
+            
+            page.drawText(line, {
+                x: textX,
+                y: textY,
+                font: font,
+                size: fontSize,
+                color: rgb(0, 0.18, 0.39),
+                opacity: Math.max(0.1, Math.min(1.0, watermarkSettings.opacity / 100)),
+            });
+          } catch (textError) {
+            console.error(`Error drawing text line "${line}" on page ${i + 1}:`, textError);
+          }
+        });
+      }
+
+      // Generate PDF with better error handling
+      let pdfBytes;
+      try {
+        pdfBytes = await pdfDoc.save({
+          useObjectStreams: false,
+          addDefaultPage: false,
+          objectsPerTick: 50
+        });
+      } catch (saveError) {
+        console.error("PDF save failed with options, trying basic save:", saveError);
+        // Fallback to basic save
+        pdfBytes = await pdfDoc.save();
+      }
+      
+      // Validate generated PDF
+      if (!pdfBytes || pdfBytes.length === 0) {
+        throw new Error("Generated PDF is empty or invalid");
+      }
+
+      // Create and download the file
+      const blob = new Blob([pdfBytes], { type: 'application/pdf' });
+      
+      // Validate blob
+      if (blob.size === 0) {
+        throw new Error("Generated PDF blob is empty");
+      }
+      
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      
+      // Generate safe filename
+      const originalName = activeFile.name.replace('.pdf', '');
+      const safeFileName = originalName.replace(/[^a-zA-Z0-9\-_]/g, '_');
+      link.download = `${safeFileName}-watermarked.pdf`;
+      
+      // Trigger download
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      
+      // Clean up URL
+      setTimeout(() => {
+        URL.revokeObjectURL(url);
+      }, 1000);
+
+    } catch (error) {
+      console.error("Failed to apply watermark:", error);
+      let errorMessage = "An error occurred while applying the watermark.";
+      
+      if (error instanceof Error) {
+        if (error.message.includes('encrypted')) {
+          errorMessage = "This PDF is encrypted and cannot be processed. Please use an unencrypted version.";
+        } else if (error.message.includes('corrupted') || error.message.includes('invalid')) {
+          errorMessage = "This PDF appears to be corrupted or invalid. Please try with a different file.";
+        } else if (error.message.includes('permissions')) {
+          errorMessage = "Insufficient permissions to modify this PDF.";
+        } else {
+          errorMessage = `PDF processing failed: ${error.message}`;
+        }
+      }
+      
+      alert(errorMessage);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const removeFile = (fileId: string) => {
+    setFiles(currentFiles => {
+        const remainingFiles = currentFiles.filter(f => f.id !== fileId);
+        if (activeFileId === fileId) {
+            setActiveFileId(remainingFiles.length > 0 ? remainingFiles[0].id : null);
+            setActivePageIndex(0);
+        }
+        return remainingFiles;
+    });
+  };
+
+  const handleRestart = () => {
+    if (window.confirm('Are you sure you want to restart? All uploaded files and progress will be lost.')) {
+        setFiles([]);
+        setActiveFileId(null);
+        setActivePageIndex(0);
+
+        localStorage.removeItem('watermarkRecipient');
+        localStorage.removeItem('watermarkPurpose');
+
+        setWatermarkSettings({
+            ...getInitialSettings(),
+            recipient: '',
+            purpose: '',
+        });
+    }
+  };
+
+  return (
+    <div className="h-screen flex flex-col bg-gray-100">
+      <Header onRestart={handleRestart} />
+      <main className="flex-grow flex flex-row p-4 gap-4 overflow-hidden">
+        {files.length === 0 ? (
+          <FileUploader onFilesAdded={handleFilesAdded} />
+        ) : (
+          <>
+            <div className="flex-grow bg-white rounded-lg shadow p-6 flex flex-col">
+              <div className="mb-4 flex-shrink-0">
+                <div className="flex items-center gap-2 flex-wrap border-b pb-4">
+                  {files.map(file => (
+                    <button
+                      key={file.id}
+                      className={`py-2 px-3 rounded-md text-sm flex items-center gap-2 transition-colors ${activeFileId === file.id ? 'bg-primary text-white shadow' : 'bg-gray-100 hover:bg-gray-200'}`}
+                      onClick={() => { setActiveFileId(file.id); setActivePageIndex(0); }}
+                    >
+                      <FileText size={14}/>
+                      <span className="font-medium truncate max-w-[200px]">{file.name}</span>
+                      <button onClick={(e) => { e.stopPropagation(); removeFile(file.id); }} className={`ml-1 p-0.5 rounded-full ${activeFileId === file.id ? 'hover:bg-primary-light' : 'hover:bg-red-100 text-red-500'}`}>
+                          <X className="h-3.5 w-3.5" />
+                      </button>
+                    </button>
+                  ))}
+                  <label htmlFor="file-upload-input" className="py-2 px-3 rounded-md text-sm flex items-center gap-2 bg-gray-200 text-gray-700 hover:bg-gray-300 transition-colors cursor-pointer">
+                      <Upload size={14} /> Add More
+                  </label>
+                  <input type="file" id="file-upload-input" multiple accept=".pdf" className="hidden" onChange={(e) => handleFilesAdded(Array.from(e.target.files || []))} />
+                </div>
+              </div>
+              
+              {activeFile && (
+                <div className="flex-grow relative min-h-0">
+                    <PdfPreviewer
+                      key={`${activeFile.id}-${activePageIndex}`}
+                      fileInfo={activeFile}
+                      activePageIndex={activePageIndex}
+                      setActivePageIndex={setActivePageIndex}
+                      watermarkSettings={watermarkSettings}
+                      onPositionChange={handlePositionChange}
+                    />
+                </div>
+              )}
+            </div>
+            
+            <div className="w-96 bg-white rounded-lg shadow p-6 flex flex-col flex-shrink-0">
+                <SettingsPanel 
+                  settings={watermarkSettings} 
+                  setSettings={setWatermarkSettings} 
+                  onApplyWatermark={handleApplyWatermark}
+                  onApplyToAll={applyPositionToAllPages}
+                  isProcessing={isProcessing}
+                />
+            </div>
+          </>
+        )}
+      </main>
+    </div>
+  );
+};
+
+export default App;
                 x: x,
                 y: currentY,
                 font: font,

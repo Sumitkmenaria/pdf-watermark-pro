@@ -21,12 +21,25 @@ const PdfPreviewer: React.FC<PdfPreviewerProps> = ({ fileInfo, activePageIndex, 
   useEffect(() => {
     setPdfDoc(null); // Reset doc on file change to trigger reload
     const loadPdf = async () => {
+      setIsLoading(true);
       try {
         const fileBuffer = await fileInfo.file.arrayBuffer();
-        const doc = await (window as any).pdfjsLib.getDocument({ data: fileBuffer }).promise;
+        
+        // More robust PDF loading for preview
+        const loadingTask = (window as any).pdfjsLib.getDocument({
+          data: fileBuffer,
+          cMapUrl: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/cmaps/',
+          cMapPacked: true,
+          standardFontDataUrl: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/standard_fonts/',
+          disableAutoFetch: false,
+          disableStream: false
+        });
+        
+        const doc = await loadingTask.promise;
         setPdfDoc(doc);
       } catch (error) {
         console.error("Failed to load PDF for preview:", error);
+        setIsLoading(false);
       }
     };
     loadPdf();
@@ -39,28 +52,63 @@ const PdfPreviewer: React.FC<PdfPreviewerProps> = ({ fileInfo, activePageIndex, 
     const renderPage = async () => {
       try {
         const page = await pdfDoc.getPage(activePageIndex + 1);
+        
+        if (!page) {
+          console.error("Failed to get page", activePageIndex + 1);
+          setIsLoading(false);
+          return;
+        }
+        
         const desiredWidth = 600;
         const viewport = page.getViewport({ scale: 1.0 });
+        
+        if (!viewport || viewport.width <= 0 || viewport.height <= 0) {
+          console.error("Invalid viewport for page", activePageIndex + 1);
+          setIsLoading(false);
+          return;
+        }
+        
         const scale = desiredWidth / viewport.width;
         const scaledViewport = page.getViewport({ scale });
   
         const canvas = canvasRef.current;
-        if (!canvas) return;
+        if (!canvas) {
+          setIsLoading(false);
+          return;
+        }
   
         const context = canvas.getContext('2d');
-        if (!context) return;
+        if (!context) {
+          setIsLoading(false);
+          return;
+        }
+        
+        // Clear canvas before rendering
+        context.clearRect(0, 0, canvas.width, canvas.height);
         
         canvas.width = scaledViewport.width;
         canvas.height = scaledViewport.height;
-        setPreviewDimensions({width: scaledViewport.width, height: scaledViewport.height});
+        
+        // Set canvas style dimensions for proper display
+        canvas.style.width = `${scaledViewport.width}px`;
+        canvas.style.height = `${scaledViewport.height}px`;
+        
+        setPreviewDimensions({
+          width: scaledViewport.width, 
+          height: scaledViewport.height
+        });
   
         const renderContext = {
           canvasContext: context,
-          viewport: scaledViewport
+          viewport: scaledViewport,
+          background: 'white'
         };
-        await page.render(renderContext).promise;
-      } catch(e) {
-        console.error("Failed to render page", e);
+        
+        const renderTask = page.render(renderContext);
+        await renderTask.promise;
+        
+      } catch(error) {
+        console.error("Failed to render page", activePageIndex + 1, error);
       } finally {
         setIsLoading(false);
       }
@@ -74,9 +122,28 @@ const PdfPreviewer: React.FC<PdfPreviewerProps> = ({ fileInfo, activePageIndex, 
   return (
     <div className="absolute inset-0 flex flex-col items-center">
         <div className="flex-grow w-full bg-gray-200/50 rounded-lg flex items-center justify-center overflow-auto p-4 relative">
-            {isLoading && <div className="text-gray-500">Loading preview...</div>}
-            <div className={`relative transition-opacity duration-300 ${isLoading ? 'opacity-0' : 'opacity-100'}`} style={{width: previewDimensions.width, height: previewDimensions.height}}>
-                <canvas ref={canvasRef} className="rounded-md shadow-lg" />
+            {isLoading && (
+              <div className="flex flex-col items-center justify-center text-gray-500">
+                <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary mb-2"></div>
+                <div>Loading preview...</div>
+              </div>
+            )}
+            <div 
+              className={`relative transition-opacity duration-300 ${isLoading ? 'opacity-0' : 'opacity-100'}`} 
+              style={{
+                width: previewDimensions.width || 'auto', 
+                height: previewDimensions.height || 'auto',
+                minWidth: isLoading ? 0 : previewDimensions.width,
+                minHeight: isLoading ? 0 : previewDimensions.height
+              }}
+            >
+                <canvas 
+                  ref={canvasRef} 
+                  className="rounded-md shadow-lg max-w-full max-h-full"
+                  style={{
+                    display: isLoading ? 'none' : 'block'
+                  }}
+                />
                 {previewDimensions.width > 0 && !isLoading && (
                     <Rnd
                         size={{ width: watermarkPos.width, height: watermarkPos.height }}
@@ -85,14 +152,22 @@ const PdfPreviewer: React.FC<PdfPreviewerProps> = ({ fileInfo, activePageIndex, 
                             onPositionChange(fileInfo.id, activePageIndex, { ...watermarkPos, x: d.x, y: d.y });
                         }}
                         onResizeStop={(e, direction, ref, delta, position) => {
-                            onPositionChange(fileInfo.id, activePageIndex, {
+                            const newWidth = parseInt(ref.style.width);
+                            const newHeight = parseInt(ref.style.height);
+                            
+                            // Validate dimensions
+                            if (newWidth > 0 && newHeight > 0) {
+                              onPositionChange(fileInfo.id, activePageIndex, {
                                 width: parseInt(ref.style.width),
                                 height: parseInt(ref.style.height),
                                 ...position,
-                            });
+                              });
+                            }
                         }}
                         bounds="parent"
-                        className="border-2 border-dashed border-primary-dark"
+                        className="border-2 border-dashed border-primary-dark bg-white/10"
+                        minWidth={100}
+                        minHeight={50}
                     >
                         <div 
                             className="w-full h-full p-1 text-blue-900 whitespace-pre-wrap break-words overflow-hidden"
@@ -102,11 +177,11 @@ const PdfPreviewer: React.FC<PdfPreviewerProps> = ({ fileInfo, activePageIndex, 
                                 lineHeight: 1.5
                             }}
                         >
-                            <p className="font-bold">COPY SHARED - STRICTLY CONFIDENTIAL FOR</p>
-                            <p className="font-bold">LIMITED USE AS DETAILED HEREUNDER</p>
-                            <p>DATE: {watermarkSettings.date}</p>
-                            <p>RECIPIENT: {watermarkSettings.recipient}</p>
-                            <p>PURPOSE: {watermarkSettings.purpose || 'N/A'}</p>
+                            <div className="font-bold">COPY SHARED - STRICTLY CONFIDENTIAL FOR</div>
+                            <div className="font-bold">LIMITED USE AS DETAILED HEREUNDER</div>
+                            <div>DATE: {watermarkSettings.date}</div>
+                            <div>RECIPIENT: {watermarkSettings.recipient}</div>
+                            <div>PURPOSE: {watermarkSettings.purpose || 'N/A'}</div>
                         </div>
                     </Rnd>
                 )}
